@@ -14,6 +14,74 @@ use std::sync::{
 };
 use std::time::Instant;
 
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "powerpc64",
+))]
+const CACHE_LINE_SIZE: usize = 128;
+
+#[cfg(target_arch = "arm")]
+const CACHE_LINE_SIZE: usize = 64;
+
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "powerpc64",
+    target_arch = "arm",
+)))]
+const CACHE_LINE_SIZE: usize = 64;
+
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "powerpc64",
+))]
+#[repr(C, align(128))]
+struct CacheAligned {
+    value: AtomicUsize,
+    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
+}
+
+#[cfg(target_arch = "arm")]
+#[repr(C, align(64))]
+struct CacheAligned {
+    value: AtomicUsize,
+    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
+}
+
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "powerpc64",
+    target_arch = "arm",
+)))]
+
+// We intentionally use a custom CacheAligned struct instead of
+// crossbeam_utils::CachePadded because CachePadded aligns to only
+// 32 bytes on 32-bit arm targets, which may not fully prevent false
+// sharing on all arm32 cache line sizes. This explicit struct uses
+// platform-specific #[repr(C, align(N))] to guarantee correct
+// alignment on every target:
+//   aarch64, x86-64, powerpc64 -> 128 bytes
+//   arm (32-bit)               -> 64 bytes
+//   all others                 -> 64 bytes
+
+#[repr(C, align(64))]
+struct CacheAligned {
+    value: AtomicUsize,
+    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
+}
+
+impl CacheAligned {
+    fn new(v: usize) -> Self {
+        CacheAligned {
+            value: AtomicUsize::new(v),
+            _pad: [0u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
+        }
+    }
+}
+
 /// An usize is used to trace the threads that are working actively.
 /// To save additional memory and atomic operation, the number and
 /// shutdown hint are merged into one number in the following format
@@ -36,9 +104,10 @@ pub fn is_shutdown(cnt: usize) -> bool {
 ///
 /// Every thread pool instance should have one and only `QueueCore`. It's
 /// saved in an `Arc` and shared between all worker threads and remote handles.
+
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
-    active_workers: AtomicUsize,
+    active_workers: CacheAligned,
     config: SchedConfig,
 }
 
@@ -46,7 +115,7 @@ impl<T> QueueCore<T> {
     pub fn new(global_queue: TaskInjector<T>, config: SchedConfig) -> QueueCore<T> {
         QueueCore {
             global_queue,
-            active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
+            active_workers: CacheAligned::new(config.max_thread_count << WORKER_COUNT_SHIFT),
             config,
         }
     }
@@ -56,8 +125,8 @@ impl<T> QueueCore<T> {
     /// If the method is going to wake up any threads, source is used to trace who triggers
     /// the action.
     pub fn ensure_workers(&self, source: usize) {
-        let cnt = self.active_workers.load(Ordering::SeqCst);
-        if (cnt >> WORKER_COUNT_SHIFT) >= self.config.core_thread_count.load(Ordering::SeqCst)
+        let cnt = self.active_workers.value.load(Ordering::Acquire);
+        if (cnt >> WORKER_COUNT_SHIFT) >= self.config.core_thread_count.load(Ordering::Acquire)
             || is_shutdown(cnt)
         {
             return;
@@ -74,7 +143,7 @@ impl<T> QueueCore<T> {
             parking_lot_core::unpark_filter(
                 addr,
                 |p: ParkToken| {
-                    if !unparked_once && p.0 <= self.config.core_thread_count.load(Ordering::SeqCst)
+                    if !unparked_once && p.0 <= self.config.core_thread_count.load(Ordering::Acquire)
                     {
                         unparked_once = true;
                         FilterOp::Unpark
@@ -91,7 +160,7 @@ impl<T> QueueCore<T> {
     ///
     /// `source` is used to trace who triggers the action.
     pub fn mark_shutdown(&self, source: usize) {
-        self.active_workers.fetch_or(SHUTDOWN_BIT, Ordering::SeqCst);
+        self.active_workers.value.fetch_or(SHUTDOWN_BIT, Ordering::AcqRel);
         let addr = self as *const QueueCore<T> as usize;
         unsafe {
             parking_lot_core::unpark_all(addr, UnparkToken(source));
@@ -100,7 +169,7 @@ impl<T> QueueCore<T> {
 
     /// Checks if the thread pool is shutting down.
     pub fn is_shutdown(&self) -> bool {
-        let cnt = self.active_workers.load(Ordering::SeqCst);
+        let cnt = self.active_workers.value.load(Ordering::Acquire);
         is_shutdown(cnt)
     }
 
@@ -108,17 +177,17 @@ impl<T> QueueCore<T> {
     ///
     /// It can be marked as sleep only when the pool is not shutting down.
     pub fn mark_sleep(&self) -> bool {
-        let mut cnt = self.active_workers.load(Ordering::SeqCst);
+        let mut cnt = self.active_workers.value.load(Ordering::Acquire);
         loop {
             if is_shutdown(cnt) {
                 return false;
             }
 
-            match self.active_workers.compare_exchange_weak(
+            match self.active_workers.value.compare_exchange_weak(
                 cnt,
                 cnt - WORKER_COUNT_BASE,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             ) {
                 Ok(_) => return true,
                 Err(n) => cnt = n,
@@ -128,13 +197,13 @@ impl<T> QueueCore<T> {
 
     /// Marks current thread as woken up states.
     pub fn mark_woken(&self) {
-        let mut cnt = self.active_workers.load(Ordering::SeqCst);
+        let mut cnt = self.active_workers.value.load(Ordering::Acquire);
         loop {
-            match self.active_workers.compare_exchange_weak(
+            match self.active_workers.value.compare_exchange_weak(
                 cnt,
                 cnt + WORKER_COUNT_BASE,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             ) {
                 Ok(_) => return,
                 Err(n) => cnt = n,
@@ -151,7 +220,7 @@ impl<T> QueueCore<T> {
         }
         self.config
             .core_thread_count
-            .store(new_thread_count, Ordering::SeqCst);
+            .store(new_thread_count, Ordering::Release);
     }
 
     pub fn config(&self) -> &SchedConfig {
@@ -355,7 +424,7 @@ impl<T: TaskCell + Send> Local<T> {
                         marked_sleep = true;
                         // If this thread is above core_thread_count, go to sleep
                         // without popping so scaled-down threads don't keep working.
-                        if id > self.core.config.core_thread_count.load(Ordering::SeqCst) {
+                        if id > self.core.config.core_thread_count.load(Ordering::Acquire) {
                             return true;
                         }
                         fail_point!("worker-pop-or-sleep-before-validate-pop");
