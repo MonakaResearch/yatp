@@ -537,15 +537,17 @@ impl LevelManager {
         let total_tasks = (cur_total_tasks - last_total_tasks) as usize;
         // adjust the batch size after meeting enough tasks.
         if total_tasks > ADJUST_LEVEL_STEAL_SIZE_THRESHOLD {
-            let new_steal_count = if level_0_tasks == 0 {
-                // level 0 has no tasks, that means the current workloads are all low-priority tasks.
-                LEVEL_MAX_QUEUE_MAX_STEAL_SIZE
-            } else {
-                // by default level0 contains 80% of all tasks, so in the most common case, only
-                // pop 1 task from level max once, and increases level max batch size when the executed
-                // tasks are more than level0.
-                std::cmp::min(total_tasks / level_0_tasks, LEVEL_MAX_QUEUE_MAX_STEAL_SIZE)
-            };
+            // When level 0 has no tasks, the current workloads are all
+            // low-priority tasks, so use the maximum steal size.
+            let new_steal_count = total_tasks.checked_div(level_0_tasks).map_or(
+                LEVEL_MAX_QUEUE_MAX_STEAL_SIZE,
+                |steal_count| {
+                    // by default level0 contains 80% of all tasks, so in the most common case, only
+                    // pop 1 task from level max once, and increases level max batch size when the executed
+                    // tasks are more than level0.
+                    std::cmp::min(steal_count, LEVEL_MAX_QUEUE_MAX_STEAL_SIZE)
+                },
+            );
             self.max_level_queue_steal_size
                 .store(new_steal_count, SeqCst);
             for (i, c) in self.last_exec_tasks_per_level.iter().enumerate() {
@@ -557,12 +559,22 @@ impl LevelManager {
     }
 }
 
-pub(super) struct TaskLevelManager {
+/// Tracks task running time and assigns multilevel scheduling levels.
+///
+/// Custom queues can use this helper to reuse the same level calculation as the
+/// built-in multilevel and priority queues before inserting a task.
+pub struct TaskLevelManager {
     task_elapsed_map: TaskElapsedMap,
     level_time_threshold: [Duration; LEVEL_NUM - 1],
 }
 
 impl TaskLevelManager {
+    /// Creates a task level manager.
+    ///
+    /// `level_time_threshold` defines the accumulated running-time boundary for
+    /// each level. `cleanup_interval` controls automatic cleanup of old task
+    /// elapsed records; set it to `None` to disable automatic cleanup and call
+    /// [`TaskLevelManager::try_cleanup`] manually.
     pub fn new(
         level_time_threshold: [Duration; LEVEL_NUM - 1],
         cleanup_interval: Option<Duration>,
@@ -573,6 +585,11 @@ impl TaskLevelManager {
         }
     }
 
+    /// Updates the task's current level according to its accumulated running time.
+    ///
+    /// If the task has a fixed level, that level is used directly. Otherwise,
+    /// the manager looks up the task's accumulated running time and compares it
+    /// with the configured thresholds.
     pub fn adjust_task_level<T>(&self, task_cell: &mut T)
     where
         T: TaskCell,
@@ -597,7 +614,11 @@ impl TaskLevelManager {
         extras.current_level = current_level;
     }
 
-    pub(super) fn try_cleanup(&self) -> Option<Instant> {
+    /// Attempts to clean up old task elapsed records.
+    ///
+    /// Returns the cleanup time if this call performed cleanup, or `None` if
+    /// another caller is already cleaning up.
+    pub fn try_cleanup(&self) -> Option<Instant> {
         self.task_elapsed_map.try_cleanup()
     }
 
@@ -920,7 +941,7 @@ pub(super) fn recent() -> Instant {
 mod tests {
     use super::*;
     use crate::pool::build_spawn;
-    use crate::queue::Extras;
+    use crate::queue::{Extras, PopResult};
 
     use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
@@ -1023,7 +1044,7 @@ mod tests {
         let (injector, mut locals) = builder.build(1);
         injector.push(MockTask::new(0, Extras::multilevel_default()));
         thread::sleep(SLEEP_DUR);
-        let schedule_time = locals[0].pop().unwrap().schedule_time;
+        let schedule_time = locals[0].pop().unwrap_ready().schedule_time;
         assert!(schedule_time.elapsed() >= SLEEP_DUR);
     }
 
@@ -1120,10 +1141,10 @@ mod tests {
             injector.push(MockTask::new(i, Extras::multilevel_default()));
         }
         let sum: u64 = (0..100)
-            .map(|_| locals[2].pop().unwrap().task_cell.sleep_ms)
+            .map(|_| locals[2].pop().unwrap_ready().task_cell.sleep_ms)
             .sum();
         assert_eq!(sum, (0..100).sum());
-        assert!(locals.iter_mut().all(|c| c.pop().is_none()));
+        assert!(locals.iter_mut().all(|c| c.pop().is_empty()));
     }
 
     #[test]
@@ -1162,7 +1183,7 @@ mod tests {
             .map(|mut consumer| {
                 let sum = sum.clone();
                 thread::spawn(move || {
-                    while let Some(pop) = consumer.pop() {
+                    while let PopResult::Ready(pop) = consumer.pop() {
                         sum.fetch_add(pop.task_cell.sleep_ms, SeqCst);
                     }
                 })
@@ -1183,7 +1204,7 @@ mod tests {
         let mut runner = runner_builder.build();
 
         remote.spawn(MockTask::new(100, Extras::new_multilevel(1, None)));
-        if let Some(Pop { task_cell, .. }) = locals[0].pop() {
+        if let PopResult::Ready(Pop { task_cell, .. }) = locals[0].pop() {
             assert!(runner.handle(&mut locals[0], task_cell));
         }
         assert!(

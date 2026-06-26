@@ -316,7 +316,7 @@ mod tests {
     use crate::pool::{build_spawn, Local, Runner, RunnerBuilder};
     use crate::queue::{
         multilevel::{now, recent},
-        Extras, InjectorInner,
+        Extras, InjectorInner, PopResult,
     };
     use rand::RngCore;
     #[derive(Debug)]
@@ -365,7 +365,7 @@ mod tests {
 
     impl TaskPriorityProvider for OrderByIdProvider {
         fn priority_of(&self, extras: &Extras) -> u64 {
-            return extras.task_id();
+            extras.task_id()
         }
     }
 
@@ -663,6 +663,29 @@ mod tests {
     #[test]
     fn test_metrics() {
         let name = "test_priority_metrics";
+        let level0_elapsed = MULTILEVEL_LEVEL_ELAPSED
+            .get_metric_with_label_values(&[name, "0"])
+            .unwrap();
+        let wait_duration = TASK_WAIT_DURATION
+            .get_metric_with_label_values(&[name])
+            .unwrap();
+        let exec_duration = TASK_EXEC_DURATION
+            .get_metric_with_label_values(&[name])
+            .unwrap();
+        let poll_duration = TASK_POLL_DURATION
+            .get_metric_with_label_values(&[name, "0"])
+            .unwrap();
+        let exec_times = TASK_EXEC_TIMES
+            .get_metric_with_label_values(&[name])
+            .unwrap();
+        let level0_elapsed_before = level0_elapsed.get();
+        let wait_count_before = wait_duration.get_sample_count();
+        let exec_duration_count_before = exec_duration.get_sample_count();
+        let exec_duration_sum_before = exec_duration.get_sample_sum();
+        let poll_duration_count_before = poll_duration.get_sample_count();
+        let poll_duration_sum_before = poll_duration.get_sample_sum();
+        let exec_times_count_before = exec_times.get_sample_count();
+        let exec_times_sum_before = exec_times.get_sample_sum();
         let builder = Builder::new(
             Config::default().name(Some(name)),
             Arc::new(OrderByIdProvider),
@@ -673,66 +696,26 @@ mod tests {
         for i in 0..4 {
             remote.spawn(MockTask::new(35, i));
         }
-        while let Some(Pop { task_cell, .. }) = locals[0].pop() {
+        while let PopResult::Ready(Pop { task_cell, .. }) = locals[0].pop() {
             assert!(runner.handle(&mut locals[0], task_cell));
         }
+        runner.flush();
 
-        // we spawn 4 tasks here but the metrics of the last one is not flush, so only check the first 3 here.
-        assert!(
-            MULTILEVEL_LEVEL_ELAPSED
-                .get_metric_with_label_values(&[name, "0"])
-                .unwrap()
-                .get()
-                > 100_000
+        // Explicitly flush local metrics so the assertions do not depend on
+        // whether the elapsed-time threshold was crossed before the last task.
+        assert!(level0_elapsed.get() - level0_elapsed_before > 100_000);
+        assert_eq!(wait_duration.get_sample_count() - wait_count_before, 4);
+        assert_eq!(
+            exec_duration.get_sample_count() - exec_duration_count_before,
+            4
         );
-        assert!(
-            TASK_WAIT_DURATION
-                .get_metric_with_label_values(&[name])
-                .unwrap()
-                .get_sample_count()
-                >= 3
+        assert!(exec_duration.get_sample_sum() - exec_duration_sum_before >= 0.1);
+        assert_eq!(
+            poll_duration.get_sample_count() - poll_duration_count_before,
+            4
         );
-        assert!(
-            TASK_EXEC_DURATION
-                .get_metric_with_label_values(&[name])
-                .unwrap()
-                .get_sample_count()
-                >= 3
-        );
-        assert!(
-            TASK_EXEC_DURATION
-                .get_metric_with_label_values(&[name])
-                .unwrap()
-                .get_sample_sum()
-                >= 0.1
-        );
-        assert!(
-            TASK_POLL_DURATION
-                .get_metric_with_label_values(&[name, "0"])
-                .unwrap()
-                .get_sample_count()
-                >= 3
-        );
-        assert!(
-            TASK_POLL_DURATION
-                .get_metric_with_label_values(&[name, "0"])
-                .unwrap()
-                .get_sample_sum()
-                >= 0.1
-        );
-        assert!(
-            TASK_EXEC_TIMES
-                .get_metric_with_label_values(&[name])
-                .unwrap()
-                .get_sample_count()
-                >= 3
-        );
-        assert!(
-            TASK_EXEC_TIMES
-                .get_metric_with_label_values(&[name])
-                .unwrap()
-                .get_sample_sum()
-                >= 3.0
-        );
+        assert!(poll_duration.get_sample_sum() - poll_duration_sum_before >= 0.1);
+        assert_eq!(exec_times.get_sample_count() - exec_times_count_before, 4);
+        assert!(exec_times.get_sample_sum() - exec_times_sum_before >= 3.0);
     }
 }
