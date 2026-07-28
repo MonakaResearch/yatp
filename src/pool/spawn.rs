@@ -14,11 +14,21 @@ use std::sync::{
 };
 use std::time::Instant;
 
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "powerpc64",
-))]
+// We intentionally use a custom CacheAligned struct instead of
+// crossbeam_utils::CachePadded because CachePadded aligns to only
+// 32 bytes on 32-bit arm targets, which may not fully prevent false
+// sharing on all arm32 cache line sizes. This explicit struct uses
+// platform-specific #[repr(C, align(N))] to guarantee correct
+// alignment on every target:
+//   aarch64              -> 256 bytes (conservative: covers Fujitsu A64FX 256-byte
+//                          cache lines; safe for Neoverse/Graviton 128-byte lines)
+//   x86-64, powerpc64   -> 128 bytes
+//   arm (32-bit)        -> 64 bytes
+//   all others          -> 64 bytes
+#[cfg(target_arch = "aarch64")]
+const CACHE_LINE_SIZE: usize = 256;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "powerpc64"))]
 const CACHE_LINE_SIZE: usize = 128;
 
 #[cfg(target_arch = "arm")]
@@ -32,9 +42,15 @@ const CACHE_LINE_SIZE: usize = 64;
 )))]
 const CACHE_LINE_SIZE: usize = 64;
 
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(256))]
+struct CacheAligned {
+    value: AtomicUsize,
+    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
+}
+
 #[cfg(any(
     target_arch = "x86_64",
-    target_arch = "aarch64",
     target_arch = "powerpc64",
 ))]
 #[repr(C, align(128))]
@@ -56,17 +72,6 @@ struct CacheAligned {
     target_arch = "powerpc64",
     target_arch = "arm",
 )))]
-
-// We intentionally use a custom CacheAligned struct instead of
-// crossbeam_utils::CachePadded because CachePadded aligns to only
-// 32 bytes on 32-bit arm targets, which may not fully prevent false
-// sharing on all arm32 cache line sizes. This explicit struct uses
-// platform-specific #[repr(C, align(N))] to guarantee correct
-// alignment on every target:
-//   aarch64, x86-64, powerpc64 -> 128 bytes
-//   arm (32-bit)               -> 64 bytes
-//   all others                 -> 64 bytes
-
 #[repr(C, align(64))]
 struct CacheAligned {
     value: AtomicUsize,
