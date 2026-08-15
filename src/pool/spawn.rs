@@ -6,6 +6,7 @@
 
 use crate::pool::SchedConfig;
 use crate::queue::{Extras, LocalQueue, Pop, PopResult, TaskCell, TaskInjector, WithExtras};
+use crossbeam_utils::CachePadded;
 use fail::fail_point;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};
 use std::sync::{
@@ -14,78 +15,8 @@ use std::sync::{
 };
 use std::time::Instant;
 
-// We intentionally use a custom CacheAligned struct instead of
-// crossbeam_utils::CachePadded because CachePadded aligns to only
-// 32 bytes on 32-bit arm targets, which may not fully prevent false
-// sharing on all arm32 cache line sizes. This explicit struct uses
-// platform-specific #[repr(C, align(N))] to guarantee correct
-// alignment on every target:
-//   aarch64              -> 256 bytes (conservative: covers Fujitsu A64FX 256-byte
-//                          cache lines; safe for Neoverse/Graviton 128-byte lines)
-//   x86-64, powerpc64   -> 128 bytes
-//   arm (32-bit)        -> 64 bytes
-//   all others          -> 64 bytes
-#[cfg(target_arch = "aarch64")]
-const CACHE_LINE_SIZE: usize = 256;
-
-#[cfg(any(target_arch = "x86_64", target_arch = "powerpc64"))]
-const CACHE_LINE_SIZE: usize = 128;
-
-#[cfg(target_arch = "arm")]
-const CACHE_LINE_SIZE: usize = 64;
-
-#[cfg(not(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "powerpc64",
-    target_arch = "arm",
-)))]
-const CACHE_LINE_SIZE: usize = 64;
-
-#[cfg(target_arch = "aarch64")]
-#[repr(C, align(256))]
-struct CacheAligned {
-    value: AtomicUsize,
-    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
-}
-
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "powerpc64",
-))]
-#[repr(C, align(128))]
-struct CacheAligned {
-    value: AtomicUsize,
-    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
-}
-
-#[cfg(target_arch = "arm")]
-#[repr(C, align(64))]
-struct CacheAligned {
-    value: AtomicUsize,
-    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
-}
-
-#[cfg(not(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "powerpc64",
-    target_arch = "arm",
-)))]
-#[repr(C, align(64))]
-struct CacheAligned {
-    value: AtomicUsize,
-    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
-}
-
-impl CacheAligned {
-    fn new(v: usize) -> Self {
-        CacheAligned {
-            value: AtomicUsize::new(v),
-            _pad: [0u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicUsize>()],
-        }
-    }
-}
+// crossbeam_utils::CachePadded is used to isolate active_workers to its
+// own cache line, preventing false sharing with global_queue in QueueCore.
 
 /// An usize is used to trace the threads that are working actively.
 /// To save additional memory and atomic operation, the number and
@@ -112,7 +43,7 @@ pub fn is_shutdown(cnt: usize) -> bool {
 
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
-    active_workers: CacheAligned,
+    active_workers: CachePadded<AtomicUsize>,
     config: SchedConfig,
 }
 
@@ -120,7 +51,7 @@ impl<T> QueueCore<T> {
     pub fn new(global_queue: TaskInjector<T>, config: SchedConfig) -> QueueCore<T> {
         QueueCore {
             global_queue,
-            active_workers: CacheAligned::new(config.max_thread_count << WORKER_COUNT_SHIFT),
+            active_workers: CachePadded::new(AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT)),
             config,
         }
     }
@@ -130,7 +61,7 @@ impl<T> QueueCore<T> {
     /// If the method is going to wake up any threads, source is used to trace who triggers
     /// the action.
     pub fn ensure_workers(&self, source: usize) {
-        let cnt = self.active_workers.value.load(Ordering::Acquire);
+        let cnt = self.active_workers.load(Ordering::Acquire);
         if (cnt >> WORKER_COUNT_SHIFT) >= self.config.core_thread_count.load(Ordering::Acquire)
             || is_shutdown(cnt)
         {
@@ -165,7 +96,7 @@ impl<T> QueueCore<T> {
     ///
     /// `source` is used to trace who triggers the action.
     pub fn mark_shutdown(&self, source: usize) {
-        self.active_workers.value.fetch_or(SHUTDOWN_BIT, Ordering::AcqRel);
+        self.active_workers.fetch_or(SHUTDOWN_BIT, Ordering::AcqRel);
         let addr = self as *const QueueCore<T> as usize;
         unsafe {
             parking_lot_core::unpark_all(addr, UnparkToken(source));
@@ -174,7 +105,7 @@ impl<T> QueueCore<T> {
 
     /// Checks if the thread pool is shutting down.
     pub fn is_shutdown(&self) -> bool {
-        let cnt = self.active_workers.value.load(Ordering::Acquire);
+        let cnt = self.active_workers.load(Ordering::Acquire);
         is_shutdown(cnt)
     }
 
@@ -182,13 +113,13 @@ impl<T> QueueCore<T> {
     ///
     /// It can be marked as sleep only when the pool is not shutting down.
     pub fn mark_sleep(&self) -> bool {
-        let mut cnt = self.active_workers.value.load(Ordering::Acquire);
+        let mut cnt = self.active_workers.load(Ordering::Acquire);
         loop {
             if is_shutdown(cnt) {
                 return false;
             }
 
-            match self.active_workers.value.compare_exchange_weak(
+            match self.active_workers.compare_exchange_weak(
                 cnt,
                 cnt - WORKER_COUNT_BASE,
                 Ordering::AcqRel,
@@ -202,9 +133,9 @@ impl<T> QueueCore<T> {
 
     /// Marks current thread as woken up states.
     pub fn mark_woken(&self) {
-        let mut cnt = self.active_workers.value.load(Ordering::Acquire);
+        let mut cnt = self.active_workers.load(Ordering::Acquire);
         loop {
-            match self.active_workers.value.compare_exchange_weak(
+            match self.active_workers.compare_exchange_weak(
                 cnt,
                 cnt + WORKER_COUNT_BASE,
                 Ordering::AcqRel,
@@ -393,7 +324,7 @@ impl<T: TaskCell + Send> Local<T> {
     }
 
     pub(crate) fn is_scaled_down_worker(&self) -> bool {
-        self.id > self.core.config.core_thread_count.load(Ordering::SeqCst)
+        self.id > self.core.config.core_thread_count.load(Ordering::Acquire)
     }
 
     pub(crate) fn drain(&mut self) {
